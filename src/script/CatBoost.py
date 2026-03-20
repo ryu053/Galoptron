@@ -1,11 +1,38 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from DataProcessor import PastRaceFeatures, NonBinaryDataset
+from DataProcessor import PastRaceFeatures, NonBinaryDataset, LoadLatest5Records
 from DataProcessor import DEFAULT_DATASET_DIR
 from catboost import Pool, CatBoostRanker
+from Netkeiba import GetHorseNamesFromNetkeiba
 
 MAX_PAST = 5
+MODEL_NAME = {
+    "中山": "catboost_ranker_model.cbm"
+}
+
+def record5ToMergedDict(record_5):
+    dict_list = []
+    padded_records = list(record_5[:MAX_PAST])
+    num_past_races = len(padded_records)
+    while len(padded_records) < MAX_PAST:
+        padded_records.append(None)
+    for record in padded_records:
+        if record is None:
+            features_dict = {
+                col: (np.nan if col in PastRaceFeatures.COLUMN_TYPES else None)
+                for col in PastRaceFeatures.__dataclass_fields__.keys()
+            }
+        else:
+            features = PastRaceFeatures.from_list(record)
+            features_dict = features.to_typed_dict()
+        dict_list.append(features_dict)
+    merged_dict = {
+        f"{k}_{i+1}": v
+        for i, d in enumerate(dict_list)
+        for k, v in d.items()
+    }
+    return merged_dict, num_past_races
 
 class BinaryDataset(NonBinaryDataset):
     def featureVector(self, race_id:str):
@@ -14,26 +41,7 @@ class BinaryDataset(NonBinaryDataset):
         for j, record_5 in enumerate(self.past_record_list):
             if np.isnan(target[j]):
                 continue
-            dict_list = []
-            padded_records = list(record_5[:MAX_PAST])
-            num_past_races = len(padded_records)
-            while len(padded_records) < MAX_PAST:
-                padded_records.append(None)
-            for record in padded_records:
-                if record is None:
-                    features_dict = {
-                        col: (np.nan if col in PastRaceFeatures.COLUMN_TYPES else None)
-                        for col in PastRaceFeatures.__dataclass_fields__.keys()
-                    }
-                else:
-                    features = PastRaceFeatures.from_list(record)
-                    features_dict = features.to_typed_dict()
-                dict_list.append(features_dict)
-            merged_dict = {
-                f"{k}_{i+1}": v
-                for i, d in enumerate(dict_list)
-                for k, v in d.items()
-            }
+            merged_dict, num_past_races = record5ToMergedDict(record_5)
             merged_dict.update({
                 "num_past_races": num_past_races,
                 "race_id": race_id,
@@ -52,13 +60,14 @@ class BinaryDataset(NonBinaryDataset):
         return target
 
 # データセットのロード
-def loadDatasets(place):
+def loadDatasets(place, start_index):
     dataset_dir = Path(DEFAULT_DATASET_DIR) / place
     if not dataset_dir.exists():
         raise FileNotFoundError(dataset_dir)
     dataset_list = sorted(dataset_dir.glob("*.csv"))
     all_features = []
-    for dataset in dataset_list:
+    print("Training starts at " + str(dataset_list[start_index]))
+    for dataset in dataset_list[start_index:]:
         bd = BinaryDataset.from_csv(dataset)
         feature_vec = bd.featureVector(dataset.stem)
         all_features.extend(feature_vec)
@@ -96,8 +105,8 @@ def loadDatasets(place):
     )
     return train_pool, valid_pool
 
-def Train(place):
-    train_pool, valid_pool = loadDatasets(place)
+def Train(place, start_index):
+    train_pool, valid_pool = loadDatasets(place, start_index)
     model = CatBoostRanker(
         iterations=1000,
         learning_rate=0.05,
@@ -110,8 +119,44 @@ def Train(place):
         devices="0"
     )
     model.fit(train_pool, eval_set=valid_pool)
-    model.save_model("catboost_ranker_model.cbm")
+    model.save_model(MODEL_NAME[place])
 
+def makePredictionInputFeature(horse_name_list):
+    feature_vec = []
+    valid_horses = []
+    for horse_name in horse_name_list:
+        record_5 = LoadLatest5Records(horse_name)
+        if record_5 == None:
+            continue
+        merged_dict, num_past_races = record5ToMergedDict(record_5)
+        merged_dict.update({"num_past_races": num_past_races})
+        feature_vec.append(merged_dict)
+        valid_horses.append(horse_name)
+    x = pd.DataFrame(feature_vec)
+    cat_cols = [col for col in x.columns
+                if any(k in col for k in PastRaceFeatures.CATEGORY_COLUMN)]
+    for col in cat_cols:
+        x[col] = x[col].fillna("missing").astype(str)
+    return x, valid_horses
+
+def Predict(horse_name_list, place):
+    x, valid_horses = makePredictionInputFeature(horse_name_list)
+    model = CatBoostRanker()
+    model.load_model(MODEL_NAME[place])
+    pred = model.predict(x)
+    order = sorted(range(len(pred)), key=lambda i: pred[i], reverse=True)
+    rank = [0] * len(pred)
+    for r, i in enumerate(order):
+        rank[i] = r + 1
+    results = list(zip(valid_horses, pred, rank))
+    results_sorted = sorted(results, key=lambda x: x[2])
+    print(f"{'Rank':<5} {'Horse':<20} {'Score':>10}")
+    print("-" * 40)
+    for name, score, rank in results_sorted:
+        print(f"{rank:<5} {name:<20} {score:>10.4f}")
+    
 
 if __name__ == "__main__":
-    Train("中山")
+    #Train("中山", 5000)
+    horse_name_list = GetHorseNamesFromNetkeiba("202506050811")
+    Predict(horse_name_list, "中山")

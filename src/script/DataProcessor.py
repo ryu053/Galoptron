@@ -323,6 +323,23 @@ def updateNonBinaryDataset():
                 jvout_path = parts[3]
                 createNonBinaryDatasetForRace(place, date, race_num, jvout_path)
 
+# 最新のレコードを読み込む
+def LoadLatest5Records(horse_name: str):
+    horse_name_initial = horse_name[0]
+    record_path = Path(DEFAULT_RECORD_DIR) / horse_name_initial / (horse_name + ".csv")
+    result = []
+    try:
+        with open(record_path, "r", encoding="cp932") as f:
+            for line in f:
+                result.append(PastRaceFeatures.from_line(line).to_list())
+    except FileNotFoundError:
+        print(f"Warning: File not found -> {record_path}")
+        return None
+    except Exception as e:
+        print(f"Warning: Failed to read file -> {record_path} ({e})")
+        return None
+    return result
+
 # データセット全体のアップデート
 def UpdateDataset():
     updateRecords()
