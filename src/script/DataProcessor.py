@@ -2,6 +2,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 import csv
 from tqdm import tqdm
+import numpy as np
 
 """
 外部IF一覧
@@ -47,6 +48,14 @@ class PastRaceFeatures:
         "final3f": float,
     }
 
+    CATEGORY_COLUMN = [
+        "surface",
+        "place",
+        "condition"
+    ]
+
+    MISSING_VALUES = ("", "---", "計不", None)
+
     def to_list(self):
         return [
             self.surface,
@@ -59,19 +68,24 @@ class PastRaceFeatures:
             self.wc,
             self.final3f
         ]
-    
+
     def to_typed_dict(self) -> dict:
         d = asdict(self)
-        for col, typ in self.COLUMN_TYPES.items():
-            if col in d:
-                val = d[col]
-                if val in ("", "---", "計不"):
+        for col, val in d.items():
+            if val in self.MISSING_VALUES:
+                if col in self.COLUMN_TYPES:
+                    d[col] = np.nan
+                else:
                     d[col] = None
-                    continue
+                continue
+            if col in self.COLUMN_TYPES:
+                typ = self.COLUMN_TYPES[col]
                 try:
                     d[col] = typ(val)
-                except ValueError:
-                    d[col] = None
+                except (ValueError, TypeError):
+                    d[col] = np.nan
+            else:
+                d[col] = val
         return d
     
     @classmethod
