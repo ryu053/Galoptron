@@ -3,6 +3,7 @@ from dataclasses import dataclass, asdict
 import csv
 from tqdm import tqdm
 import numpy as np
+from datetime import datetime
 
 """
 外部IF一覧
@@ -38,6 +39,11 @@ class PastRaceFeatures:
     hw: str             # 馬体重
     wc: str             # ウェイト変化
     final3f: str        # 上がり3ハロン
+    p1: str
+    p2: str
+    p3: str
+    p4: str
+    pci: str
 
     COLUMN_TYPES = {
         "distance": int,
@@ -46,6 +52,11 @@ class PastRaceFeatures:
         "hw": int,
         "wc": int,
         "final3f": float,
+        "p1": int,
+        "p2": int,
+        "p3": int,
+        "p4": int,
+        "pci": float
     }
 
     CATEGORY_COLUMN = [
@@ -56,18 +67,15 @@ class PastRaceFeatures:
 
     MISSING_VALUES = ("", "---", "計不", None)
 
+    TIME_SCALE_IDX = {
+        "jw": 5,
+        "hw": 6,
+        "final3f": 8,
+        "pci": 13
+    }
+
     def to_list(self):
-        return [
-            self.surface,
-            self.place,
-            self.distance,
-            self.condition,
-            self.time,
-            self.jw,
-            self.hw,
-            self.wc,
-            self.final3f
-        ]
+        return list(asdict(self).values())
 
     def to_typed_dict(self) -> dict:
         d = asdict(self)
@@ -100,7 +108,12 @@ class PastRaceFeatures:
             jw=parts[19],
             hw=parts[30],
             wc=parts[31],
-            final3f=parts[29]
+            final3f=parts[29],
+            p1=parts[24],
+            p2=parts[25],
+            p3=parts[26],
+            p4=parts[27],
+            pci=parts[13]
         )
     
     @classmethod
@@ -114,24 +127,201 @@ class NonBinaryDataset:
     horse_name_list: list       # 頭数n 次元
     finish_order_list: list     # 頭数n 次元
     past_record_list: list      # 頭数n × 過去レース数5 × 特徴量数m 次元
+    alpha_conditions: list      # レースコンディション[クラス名, 芝・ダ, 距離]
+    horse_conditions: list      # 馬のコンディション
+    race_date_list: list        # 頭数n ×　過去レース数5
+    dataset_race_date: str
 
-    def to_csv(self, file_name):
+    DEFAULT_SPEC_CONDITIONS = [None, None, None]
+    PADDING_VALUES = {
+        "date": -1,
+        "jw": 0,
+        "hw": 0,
+        "final3f": 0,
+        "pci": 0
+    }
+
+    def to_csv(self, file_name:Path):
         Path(file_name).parent.mkdir(parents=True, exist_ok=True)
         with open(file_name, "w", encoding="cp932") as f:
+            print(*self.alpha_conditions, sep=",", file=f)
             for i, horse_name in enumerate(self.horse_name_list):
-                f.write(horse_name + "," + self.finish_order_list[i] + "\n")
-                for line in self.past_record_list[i]:
-                    print(*line, sep=",", file=f)
+                f.write(horse_name + "," + self.finish_order_list[i] + ",")
+                print(*self.horse_conditions[i], sep=",", file=f)
+                for j, line in enumerate(self.past_record_list[i]):
+                    print(*line, sep=",", file=f, end=",")
+                    print(self.race_date_list[i][j], file=f)
                 f.write("\n")
+    
+    def to_time_scale_dataset(self, max_len=5):
+        base = datetime.strptime(self.dataset_race_date, "%Y%m%d")
+
+        date_now_list, date_diff_list = [], []
+        jw_now_list, jw_diff_list = [], []
+        hw_now_list, hw_diff_list = [], []
+        f3_diff_list, pci_diff_list = [], []
+
+        for i in range(len(self.race_date_list)):
+            dates = self.race_date_list[i] or []
+            records = self.past_record_list[i] or []
+
+            # =========================
+            # ペア化 & ソート
+            # =========================
+            paired = []
+            for j in range(min(len(dates), len(records))):
+                try:
+                    dt = datetime.strptime(dates[j], "%Y%m%d")
+                    paired.append((dt, records[j]))
+                except:
+                    continue
+
+            paired = sorted(paired, key=lambda x: x[0])
+
+            dt_list = [p[0] for p in paired]
+
+            # =========================
+            # date_now
+            # =========================
+            date_now = [(base - dt).days for dt in dt_list]
+            date_now = date_now[:max_len]
+            while len(date_now) < max_len:
+                date_now.append(self.PADDING_VALUES.get("date", -1))
+            date_now_list.append(date_now)
+
+            # =========================
+            # date_diff
+            # =========================
+            date_diff = []
+            for j in range(1, len(dt_list)):
+                date_diff.append((dt_list[j] - dt_list[j-1]).days)
+
+            date_diff = date_diff[:max_len]
+            while len(date_diff) < max_len:
+                date_diff.append(self.PADDING_VALUES.get("date", -1))
+            date_diff_list.append(date_diff)
+
+            # =========================
+            # 現在値
+            # =========================
+            try:
+                current_jw = float(self.horse_conditions[i][0])
+            except:
+                current_jw = None
+
+            try:
+                current_hw = float(self.horse_conditions[i][1])
+            except:
+                current_hw = None
+
+            jw_seq, hw_seq, f3_seq, pci_seq = [], [], [], []
+
+            for _, rec in paired:
+                try:
+                    jw_seq.append(float(rec[PastRaceFeatures.TIME_SCALE_IDX["jw"]]))
+                except:
+                    jw_seq.append(None)
+
+                try:
+                    hw_seq.append(float(rec[PastRaceFeatures.TIME_SCALE_IDX["hw"]]))
+                except:
+                    hw_seq.append(None)
+
+                try:
+                    f3_seq.append(float(rec[PastRaceFeatures.TIME_SCALE_IDX["final3f"]]))
+                except:
+                    f3_seq.append(None)
+
+                try:
+                    pci_seq.append(float(rec[PastRaceFeatures.TIME_SCALE_IDX["pci"]]))
+                except:
+                    pci_seq.append(None)
+
+            # =========================
+            # jw_now / hw_now
+            # =========================
+            jw_now, hw_now = [], []
+
+            for j in range(len(jw_seq)):
+                jw_now.append(current_jw - jw_seq[j] if current_jw is not None and jw_seq[j] is not None else self.PADDING_VALUES.get("jw", 0))
+                hw_now.append(current_hw - hw_seq[j] if current_hw is not None and hw_seq[j] is not None else self.PADDING_VALUES.get("hw", 0))
+
+            jw_now = jw_now[:max_len]
+            hw_now = hw_now[:max_len]
+
+            while len(jw_now) < max_len:
+                jw_now.append(self.PADDING_VALUES.get("jw", 0))
+            while len(hw_now) < max_len:
+                hw_now.append(self.PADDING_VALUES.get("hw", 0))
+
+            jw_now_list.append(jw_now)
+            hw_now_list.append(hw_now)
+
+            # =========================
+            # jw_diff / hw_diff / f3_diff / pci_diff
+            # =========================
+            jw_diff, hw_diff, f3_diff, pci_diff = [], [], [], []
+
+            for j in range(1, len(jw_seq)):
+                # jw
+                if jw_seq[j] is not None and jw_seq[j-1] is not None:
+                    jw_diff.append(jw_seq[j] - jw_seq[j-1])
+                else:
+                    jw_diff.append(self.PADDING_VALUES.get("jw", 0))
+
+                # hw
+                if hw_seq[j] is not None and hw_seq[j-1] is not None:
+                    hw_diff.append(hw_seq[j] - hw_seq[j-1])
+                else:
+                    hw_diff.append(self.PADDING_VALUES.get("hw", 0))
+
+                # f3
+                if f3_seq[j] is not None and f3_seq[j-1] is not None:
+                    f3_diff.append(f3_seq[j] - f3_seq[j-1])
+                else:
+                    f3_diff.append(self.PADDING_VALUES.get("final3f", 0))
+
+                # pci
+                if pci_seq[j] is not None and pci_seq[j-1] is not None:
+                    pci_diff.append(pci_seq[j] - pci_seq[j-1])
+                else:
+                    pci_diff.append(self.PADDING_VALUES.get("pci", 0))
+
+            # パディング
+            for arr, key in [
+                (jw_diff, "jw"),
+                (hw_diff, "hw"),
+                (f3_diff, "final3f"),
+                (pci_diff, "pci"),
+            ]:
+                del arr[max_len:]
+                while len(arr) < max_len:
+                    arr.append(self.PADDING_VALUES.get(key, 0))
+
+            jw_diff_list.append(jw_diff)
+            hw_diff_list.append(hw_diff)
+            f3_diff_list.append(f3_diff)
+            pci_diff_list.append(pci_diff)
+
+        return (
+            date_now_list, date_diff_list,
+            jw_now_list, jw_diff_list,
+            hw_now_list, hw_diff_list,
+            f3_diff_list, pci_diff_list
+        )
 
     @classmethod
     def from_csv(cls, file_name):
+        alpha_conditions = []
         horse_name_list = []
         finish_order_list = []
+        horse_conditions = []
         past_record_list = []
+        race_date_list = []
         with open(file_name, "r", encoding="cp932") as f:
             lines = [line.strip() for line in f]
-        i = 0
+        alpha_conditions = lines[0].split(",")
+        i = 1
         while i < len(lines):
             if not lines[i]:
                 i += 1
@@ -139,15 +329,40 @@ class NonBinaryDataset:
             parts = lines[i].split(",")
             horse_name = parts[0]
             finish_order = parts[1]
+            horse_cond = parts[2:]
             horse_name_list.append(horse_name)
             finish_order_list.append(finish_order)
+            horse_conditions.append(horse_cond)
             i += 1
             past_records = []
+            race_dates = []
             while i < len(lines) and lines[i]:
-                past_records.append(lines[i].split(","))
+                row = lines[i].split(",")
+                past_records.append(row[:-1])
+                race_dates.append(row[-1])
                 i += 1
             past_record_list.append(past_records)
-        return cls(horse_name_list, finish_order_list, past_record_list)
+            race_date_list.append(race_dates)
+        dataset_race_date = Path(file_name).name.split("_")[0]
+        return cls(
+            horse_name_list,
+            finish_order_list,
+            past_record_list,
+            alpha_conditions,
+            horse_conditions,
+            race_date_list,
+            dataset_race_date
+        )
+    
+# 時系列データクラス
+@dataclass
+class TimeScaleData:
+    delta_days: int
+    delta_jw: float
+    delta_hw: int
+    delta_final3f: float
+    delta_pci: float
+
 
 # 1レース単位の開催情報とjvoutのファイルを紐づけるクラス
 @dataclass
@@ -260,6 +475,7 @@ def updateRaceSchedules():
 # 過去5レース分の特徴量を取得する関数
 def extractFeaturesFromRecord(horse_name, date:tuple):
     results = []
+    record_dates = []
     horse_name_initial = horse_name[0]
     record_path = Path(DEFAULT_RECORD_DIR) / horse_name_initial / f"{horse_name}.csv"
     with open(record_path, "r", encoding="cp932") as rf:
@@ -270,9 +486,14 @@ def extractFeaturesFromRecord(horse_name, date:tuple):
                 continue
             result = PastRaceFeatures.from_line(line)
             results.append(result.to_list())
+            if int(parts[0]) < 50:
+                record_date = "20" + parts[0].zfill(2) + parts[1].zfill(2) + parts[2].zfill(2)
+            else:
+                record_date = "19" + parts[0].zfill(2) + parts[1].zfill(2) + parts[2].zfill(2)
+            record_dates.append(record_date)
             if len(results) >= 5:
                 break
-    return results
+    return results, record_dates
 
 # 会場と日付、レース番号を指定して、データセットに変換する関数
 def createNonBinaryDatasetForRace(place:str, date:str, race_num:str, jvout_path:str):
@@ -283,27 +504,42 @@ def createNonBinaryDatasetForRace(place:str, date:str, race_num:str, jvout_path:
     jv_date_int = tuple(map(int, jv_date))
     horse_name_list = []
     finish_order_list = []
+    alpha_conditions = []
+    horse_conditions = []
+    race_date_list = []
     is_extracted = False
+    lines_cnt = 0
     with open(jvout_path, "r", encoding="cp932") as f:
         for line in f:
             parts = line.strip().split(",")
             if (parts[0] == jv_date[0] and parts[1] == jv_date[1] and parts[2] == jv_date[2] and parts[4] == race_num):
+                if lines_cnt == 0:
+                    alpha_conditions.append(parts[6])
+                    alpha_conditions.append(parts[7])
+                    alpha_conditions.append(parts[8])
+                    lines_cnt += 1
                 is_extracted = True
                 horse_name_list.append(parts[15])
                 finish_order_list.append(parts[21])
+                horse_conditions.append([parts[19], parts[30]])
             elif is_extracted == False:
                 continue
             else:
                 break
     past_record_list = []
     for horse_name in horse_name_list:
-        past_record = extractFeaturesFromRecord(horse_name, jv_date_int)
+        past_record, record_dates = extractFeaturesFromRecord(horse_name, jv_date_int)
         past_record_list.append(past_record)
+        race_date_list.append(record_dates)
     output_file_name = Path(DEFAULT_DATASET_DIR) / place / (date + "_" + race_num + ".csv")
     NonBinaryDataset(
         horse_name_list=horse_name_list,
         finish_order_list=finish_order_list,
-        past_record_list=past_record_list
+        past_record_list=past_record_list,
+        alpha_conditions=alpha_conditions,
+        horse_conditions=horse_conditions,
+        race_date_list=race_date_list,
+        dataset_race_date=date
     ).to_csv(output_file_name)
 
 # ノンバイナリデータセットのアップデート
@@ -324,29 +560,39 @@ def updateNonBinaryDataset():
                 createNonBinaryDatasetForRace(place, date, race_num, jvout_path)
 
 # 最新のレコードを読み込む
-def LoadLatest5Records(horse_name: str):
+def LoadLatest5Records(horse_name: str) -> tuple:
     horse_name_initial = horse_name[0]
     record_path = Path(DEFAULT_RECORD_DIR) / horse_name_initial / (horse_name + ".csv")
     result = []
+    race_dates = []
     try:
         with open(record_path, "r", encoding="cp932") as f:
             for line in f:
                 result.append(PastRaceFeatures.from_line(line).to_list())
+                parts = line.strip().split(",")
+                if int(parts[0]) < 50:
+                    record_date = "20" + parts[0].zfill(2) + parts[1].zfill(2) + parts[2].zfill(2)
+                else:
+                    record_date = "19" + parts[0].zfill(2) + parts[1].zfill(2) + parts[2].zfill(2)
+                race_dates.append(record_date)
     except FileNotFoundError:
         print(f"Warning: File not found -> {record_path}")
-        return None
+        return None, None
     except Exception as e:
         print(f"Warning: Failed to read file -> {record_path} ({e})")
-        return None
-    return result
+        return None, None
+    return result, race_dates
 
 # データセット全体のアップデート
 def UpdateDataset():
-    updateRecords()
-    updateRaceSchedules()
+    # updateRecords()
+    # updateRaceSchedules()
     updateNonBinaryDataset()
 
 if __name__ == "__main__":
-    UpdateDataset()
+    #UpdateDataset()
+    nbd = NonBinaryDataset.from_csv(r"..\data\dataset\中山\20251207_1.csv")
+    for l in nbd.to_time_scale_dataset():
+        print(l)
     pass
 

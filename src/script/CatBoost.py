@@ -5,7 +5,10 @@ from DataProcessor import PastRaceFeatures, NonBinaryDataset, LoadLatest5Records
 from DataProcessor import DEFAULT_DATASET_DIR
 from catboost import Pool, CatBoostRanker
 from Netkeiba import GetHorseNamesFromNetkeiba
+from tqdm import tqdm
+import shutil
 
+DEFAULT_PREDICTION_OUTPUT_DIR = r"..\data\catboost"
 MAX_PAST = 5
 MODEL_NAME = {
     "中山": "catboost_ranker_model.cbm"
@@ -50,6 +53,14 @@ class BinaryDataset(NonBinaryDataset):
             feature_vec.append(merged_dict)
         return feature_vec
     
+    def featureVectorForPredict(self):
+        feature_vec = []
+        for j, record_5 in enumerate(self.past_record_list):
+            merged_dict, num_past_races = record5ToMergedDict(record_5)
+            merged_dict.update({"num_past_races": num_past_races})
+            feature_vec.append(merged_dict)
+        return feature_vec, self.horse_name_list
+    
     def setPredictionTarget(self):
         target = []
         for finish_order in self.finish_order_list:
@@ -58,9 +69,17 @@ class BinaryDataset(NonBinaryDataset):
             else:
                 target.append(1.0 / int(finish_order))
         return target
+    
+def checkConditions(data_conditions, query_conditions):
+    for dc, qc in zip(data_conditions, query_conditions):
+        if qc is None:
+            continue
+        if dc != qc:
+            return False
+    return True
 
 # データセットのロード
-def loadDatasets(place, start_index):
+def loadDatasets(place, start_index, conditions):
     dataset_dir = Path(DEFAULT_DATASET_DIR) / place
     if not dataset_dir.exists():
         raise FileNotFoundError(dataset_dir)
@@ -69,9 +88,13 @@ def loadDatasets(place, start_index):
     print("Training starts at " + str(dataset_list[start_index]))
     for dataset in dataset_list[start_index:]:
         bd = BinaryDataset.from_csv(dataset)
+        condition_check = checkConditions(bd.alpha_conditions, conditions)
+        if condition_check == False:
+            continue
         feature_vec = bd.featureVector(dataset.stem)
         all_features.extend(feature_vec)
     df = pd.DataFrame(all_features)
+    print(df.shape)
     race_ids = sorted(df["race_id"].unique())
     split = int(len(race_ids) * 0.8)
     train_ids = race_ids[:split]
@@ -105,8 +128,8 @@ def loadDatasets(place, start_index):
     )
     return train_pool, valid_pool
 
-def Train(place, start_index):
-    train_pool, valid_pool = loadDatasets(place, start_index)
+def Train_Catboost(place, start_index, spec_conditions=NonBinaryDataset.DEFAULT_SPEC_CONDITIONS):
+    train_pool, valid_pool = loadDatasets(place, start_index, spec_conditions)
     model = CatBoostRanker(
         iterations=1000,
         learning_rate=0.05,
@@ -125,7 +148,7 @@ def makePredictionInputFeature(horse_name_list):
     feature_vec = []
     valid_horses = []
     for horse_name in horse_name_list:
-        record_5 = LoadLatest5Records(horse_name)
+        record_5, _ = LoadLatest5Records(horse_name)
         if record_5 == None:
             continue
         merged_dict, num_past_races = record5ToMergedDict(record_5)
@@ -139,7 +162,7 @@ def makePredictionInputFeature(horse_name_list):
         x[col] = x[col].fillna("missing").astype(str)
     return x, valid_horses
 
-def Predict(horse_name_list, place):
+def Predict_Catboost(horse_name_list, place):
     x, valid_horses = makePredictionInputFeature(horse_name_list)
     model = CatBoostRanker()
     model.load_model(MODEL_NAME[place])
@@ -154,9 +177,36 @@ def Predict(horse_name_list, place):
     print("-" * 40)
     for name, score, rank in results_sorted:
         print(f"{rank:<5} {name:<20} {score:>10.4f}")
-    
+    return list(zip(valid_horses, pred))
+
+def MultiplePredictionForTransFormer(place, conditions):
+    shutil.rmtree(Path(DEFAULT_PREDICTION_OUTPUT_DIR) / place)
+    (Path(DEFAULT_PREDICTION_OUTPUT_DIR) / place).mkdir(parents=True, exist_ok=True)
+    model = CatBoostRanker()
+    model.load_model(MODEL_NAME[place])
+    dataset_dir = Path(DEFAULT_DATASET_DIR) / place
+    if not dataset_dir.exists():
+        raise FileNotFoundError(dataset_dir)
+    dataset_list = sorted(dataset_dir.glob("*.csv"))
+    for dataset in tqdm(dataset_list, desc="Prediction"):
+        bd = BinaryDataset.from_csv(dataset)
+        condition_check = checkConditions(bd.alpha_conditions, conditions)
+        if condition_check == False:
+            continue
+        feature_vec, horse_name_list = bd.featureVectorForPredict()
+        x = pd.DataFrame(feature_vec)
+        cat_cols = [col for col in x.columns
+                    if any(k in col for k in PastRaceFeatures.CATEGORY_COLUMN)]
+        for col in cat_cols:
+            x[col] = x[col].fillna("missing").astype(str)
+        pred = model.predict(x)
+        result = list(zip(horse_name_list, pred))
+        df = pd.DataFrame(result, columns=["horse_name", "score"])
+        df.to_parquet(Path(DEFAULT_PREDICTION_OUTPUT_DIR) / place / (dataset.stem + ".parquet"))
 
 if __name__ == "__main__":
-    #Train("中山", 5000)
-    horse_name_list = GetHorseNamesFromNetkeiba("202506050811")
-    Predict(horse_name_list, "中山")
+    Train_Catboost("中山", 0, [None, "芝", "1800"])
+    horse_name_list = GetHorseNamesFromNetkeiba("202606020711")
+    Predict_Catboost(horse_name_list, "中山")
+    # MultiplePredictionForTransFormer("中山", [None, "芝", "1800"])
+    pass
