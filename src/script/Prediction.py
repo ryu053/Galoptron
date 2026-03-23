@@ -22,10 +22,26 @@ def Full_Predict(race_id, place, train_start_idx, alpha_condition, date=None):
     cb_score = [p for _, p in cb_result]
     Predict_Transformer(horse_names, horse_conditions, place, cb_score, date)
 
+def Catboost_Predict(race_id, place, train_start_idx, alpha_condition, date=None):
+    if date is None:
+        date = datetime.today()
+    else:
+        date = datetime.strptime(date, "%Y%m%d")
+    
+    Train_Catboost(place, train_start_idx, alpha_condition)
+    horse_names, horse_conditions = GetHorseDataFromNetkeiba(race_id)
+    Predict_Catboost(horse_names, place)
+
 if __name__ == "__main__":
-    Full_Predict(
-        "202606020711",
+    # Full_Predict(
+    #     "202606020711",
+    #     "中山",
+    #     0,
+    #     [None, "芝", "1800"],
+    #     "20260321")
+    Catboost_Predict(
+        "202606020810",
         "中山",
         0,
         [None, "芝", "1800"],
-        "20260321")
+        "20260322")

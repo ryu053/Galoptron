@@ -3,10 +3,11 @@ import numpy as np
 from pathlib import Path
 from DataProcessor import PastRaceFeatures, NonBinaryDataset, LoadLatest5Records
 from DataProcessor import DEFAULT_DATASET_DIR
-from catboost import Pool, CatBoostRanker
+from catboost import Pool, CatBoostRanker, EFstrType
 from Netkeiba import GetHorseNamesFromNetkeiba
 from tqdm import tqdm
 import shutil
+import csv
 
 DEFAULT_PREDICTION_OUTPUT_DIR = r"..\data\catboost"
 MAX_PAST = 5
@@ -30,12 +31,34 @@ def record5ToMergedDict(record_5):
             features = PastRaceFeatures.from_list(record)
             features_dict = features.to_typed_dict()
         dict_list.append(features_dict)
+
+    #条件別要約情報の収集
+    shiba_good_final3f = []
+    shiba_heavy_final3f = []
+    durt_good_final3f = []
+    durt_heavy_final3f = []
+    for d in dict_list:
+        if (d["condition"] == "良" or d["condition"] == "稍") and (d["surface"] == "芝"):
+            shiba_good_final3f.append(d["final3f"])
+        if (d["condition"] == "重" or d["condition"] == "不") and (d["surface"] == "芝"):
+            shiba_heavy_final3f.append(d["final3f"])
+        if (d["condition"] == "良" or d["condition"] == "稍") and (d["surface"] == "ダ"):
+            durt_good_final3f.append(d["final3f"])
+        if (d["condition"] == "重" or d["condition"] == "不") and (d["surface"] == "ダ"):
+            durt_heavy_final3f.append(d["final3f"])
+    final3f_ave = {
+        "shiba_good": np.mean(shiba_good_final3f) if shiba_good_final3f else np.nan,
+        "shiba_heavy": np.mean(shiba_heavy_final3f) if shiba_heavy_final3f else np.nan,
+        "durt_good": np.mean(durt_good_final3f) if durt_good_final3f else np.nan,
+        "durt_heavy": np.mean(durt_heavy_final3f) if durt_heavy_final3f else np.nan,
+    }
+        
     merged_dict = {
         f"{k}_{i+1}": v
         for i, d in enumerate(dict_list)
         for k, v in d.items()
     }
-    return merged_dict, num_past_races
+    return merged_dict, num_past_races, final3f_ave
 
 class BinaryDataset(NonBinaryDataset):
     def featureVector(self, race_id:str):
@@ -44,9 +67,13 @@ class BinaryDataset(NonBinaryDataset):
         for j, record_5 in enumerate(self.past_record_list):
             if np.isnan(target[j]):
                 continue
-            merged_dict, num_past_races = record5ToMergedDict(record_5)
+            merged_dict, num_past_races, final3f_ave = record5ToMergedDict(record_5)
             merged_dict.update({
                 "num_past_races": num_past_races,
+                "shiba_good_final3f_ave": final3f_ave["shiba_good"],
+                "shiba_heavy_final3f_ave": final3f_ave["shiba_heavy"],
+                "durt_good_final3f_ave": final3f_ave["durt_good"],
+                "durt_heavy_final3f_ave": final3f_ave["durt_heavy"],
                 "race_id": race_id,
                 "target": target[j]
             })
@@ -56,8 +83,14 @@ class BinaryDataset(NonBinaryDataset):
     def featureVectorForPredict(self):
         feature_vec = []
         for j, record_5 in enumerate(self.past_record_list):
-            merged_dict, num_past_races = record5ToMergedDict(record_5)
-            merged_dict.update({"num_past_races": num_past_races})
+            merged_dict, num_past_races, final3f_ave = record5ToMergedDict(record_5)
+            merged_dict.update({
+                "num_past_races": num_past_races,
+                "shiba_good_final3f_ave": final3f_ave["shiba_good"],
+                "shiba_heavy_final3f_ave": final3f_ave["shiba_heavy"],
+                "durt_good_final3f_ave": final3f_ave["durt_good"],
+                "durt_heavy_final3f_ave": final3f_ave["durt_heavy"],
+                })
             feature_vec.append(merged_dict)
         return feature_vec, self.horse_name_list
     
@@ -130,18 +163,43 @@ def loadDatasets(place, start_index, conditions):
 
 def Train_Catboost(place, start_index, spec_conditions=NonBinaryDataset.DEFAULT_SPEC_CONDITIONS):
     train_pool, valid_pool = loadDatasets(place, start_index, spec_conditions)
+
     model = CatBoostRanker(
         iterations=1000,
         learning_rate=0.05,
         depth=6,
-        loss_function="YetiRank",   # ランキング用
+        loss_function="YetiRank",
         eval_metric="NDCG",
         early_stopping_rounds=50,
         verbose=100,
         task_type="GPU",
         devices="0"
     )
+
     model.fit(train_pool, eval_set=valid_pool)
+
+    # 特徴量重要度を取得
+    importances = model.get_feature_importance(type=EFstrType.PredictionValuesChange)
+    importances = np.array(importances)
+    feature_names = train_pool.get_feature_names()
+
+    # 保存先
+    output_dir = Path("feature_importance") / place
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "feature_importance.csv"
+
+    # 重要度を大きい順に並べる
+    rows = list(zip(feature_names, importances))
+    rows.sort(key=lambda x: x[1], reverse=True)
+
+    # CSV出力
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["feature_name", "importance"])
+        writer.writerows(rows)
+
+    print(f"feature importance saved: {output_file}")
+
     model.save_model(MODEL_NAME[place])
 
 def makePredictionInputFeature(horse_name_list):
@@ -151,8 +209,14 @@ def makePredictionInputFeature(horse_name_list):
         record_5, _ = LoadLatest5Records(horse_name)
         if record_5 == None:
             continue
-        merged_dict, num_past_races = record5ToMergedDict(record_5)
-        merged_dict.update({"num_past_races": num_past_races})
+        merged_dict, num_past_races, final3f_ave = record5ToMergedDict(record_5)
+        merged_dict.update({
+            "num_past_races": num_past_races,
+            "shiba_good_final3f_ave": final3f_ave["shiba_good"],
+            "shiba_heavy_final3f_ave": final3f_ave["shiba_heavy"],
+            "durt_good_final3f_ave": final3f_ave["durt_good"],
+            "durt_heavy_final3f_ave": final3f_ave["durt_heavy"],
+            })
         feature_vec.append(merged_dict)
         valid_horses.append(horse_name)
     x = pd.DataFrame(feature_vec)
